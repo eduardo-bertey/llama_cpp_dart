@@ -5,6 +5,9 @@ analyzer:
     - 'lib/src/ffi/bindings.dart'
     - 'src/**'
     - 'build/**'
+    # Flutter app with its own dependency graph; analyzed by `flutter analyze`
+    # inside app-openmoe (see .github/workflows/build-windows.yml).
+    - 'app-openmoe/**'
 
   language:
     strict-casts: true
