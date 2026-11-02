@@ -69,15 +69,17 @@ jobs:
       - name: loader probe against the real DLLs
         run: dart run tool/probe_windows_dlls.dart build\win-libs
 
-      - name: download smoke model (Qwen3.5-0.8B Q4_0, ~563 MB)
-        run: |
-          New-Item -ItemType Directory -Force build\smoke-model | Out-Null
-          Invoke-WebRequest `
-            -Uri 'https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_0.gguf' `
-            -OutFile build\smoke-model\Qwen3.5-0.8B-Q4_0.gguf
-
-      - name: ABI smoke — load real model with the real DLLs
-        run: dart run tool/smoke_windows_model.dart build\win-libs build\smoke-model\Qwen3.5-0.8B-Q4_0.gguf
+      # Deshabilitado: el smoke con modelo real ya validó la ABI (el fix de
+      # bindings b12050 pasó). Reactivarlo para diagnosticar otro crash ABI.
+      # - name: download smoke model (Qwen3.5-0.8B Q4_0, ~563 MB)
+      #   run: |
+      #     New-Item -ItemType Directory -Force build\smoke-model | Out-Null
+      #     Invoke-WebRequest `
+      #       -Uri 'https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_0.gguf' `
+      #       -OutFile build\smoke-model\Qwen3.5-0.8B-Q4_0.gguf
+      #
+      # - name: ABI smoke — load real model with the real DLLs
+      #   run: dart run tool/smoke_windows_model.dart build\win-libs build\smoke-model\Qwen3.5-0.8B-Q4_0.gguf
 
       - name: flutter pub get (app-openmoe)
         working-directory: app-openmoe

@@ -43,6 +43,42 @@ const _gb = 1024 * 1024 * 1024;
 const _mb = 1024 * 1024;
 
 const hfCatalog = <HfModelEntry>[
+  // SmolLM2 360M instruct — the lightest practical assistant. Text-only
+  // (HuggingFaceTB publishes no mmproj for it). Q4_K_M, bartowski build.
+  HfModelEntry(
+    id: 'smollm2-360m-q4km',
+    label: 'SmolLM2 360M (Q4_K_M, ~0.27 GB, texto)',
+    repo: 'bartowski/SmolLM2-360M-Instruct-GGUF',
+    modelFiles: [
+      HfFile('SmolLM2-360M-Instruct-Q4_K_M.gguf', sizeBytes: 270590880),
+    ],
+    mmprojFile: null,
+    approxBytes: 270590880,
+    recommended: true,
+  ),
+  // Qwen 2.5 0.5B instruct — official Qwen conversion, text-only. No mmproj
+  // exists for this size.
+  HfModelEntry(
+    id: 'qwen25-05b-q4km',
+    label: 'Qwen 2.5 0.5B (Q4_K_M, ~0.5 GB, texto)',
+    repo: 'Qwen/Qwen2.5-0.5B-Instruct-GGUF',
+    modelFiles: [
+      HfFile('qwen2.5-0.5b-instruct-q4_k_m.gguf', sizeBytes: 491400032),
+    ],
+    mmprojFile: null,
+    approxBytes: 491400032,
+  ),
+  // SmolLM2 135M instruct — the smallest entry, useful on very weak PCs.
+  HfModelEntry(
+    id: 'smollm2-135m-q4km',
+    label: 'SmolLM2 135M (Q4_K_M, ~0.1 GB, texto)',
+    repo: 'bartowski/SmolLM2-135M-Instruct-GGUF',
+    modelFiles: [
+      HfFile('SmolLM2-135M-Instruct-Q4_K_M.gguf', sizeBytes: 105454432),
+    ],
+    mmprojFile: null,
+    approxBytes: 105454432,
+  ),
   // Qwen 0.8B, OFFICIAL conversion from ggml-org (the GGUF of
   // Qwen/Qwen3.5-0.8B). Its convert.log shows text tensors only — the GGUF
   // has no vision encoder and no official mmproj exists for this arch yet,
@@ -54,7 +90,6 @@ const hfCatalog = <HfModelEntry>[
     modelFiles: [HfFile('Qwen3.5-0.8B-Q4_0.gguf', sizeBytes: 563036064)],
     mmprojFile: null,
     approxBytes: 563036064,
-    recommended: true,
   ),
   HfModelEntry(
     id: 'qwen35-08b-official-q8',

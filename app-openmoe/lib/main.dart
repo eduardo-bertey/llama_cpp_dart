@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'crash_log.dart';
-import 'setup_page.dart';
+import 'home_page.dart';
 
 void _reportFlutterError(FlutterErrorDetails details) {
   appendCrashLog(
@@ -41,7 +41,7 @@ class OpenMoeApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF7C4DFF)),
       ),
-      home: SetupPage(lastSessionCrash: lastSessionCrash),
+      home: HomePage(lastSessionCrash: lastSessionCrash),
     );
   }
 }

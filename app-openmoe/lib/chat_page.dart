@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:llama_cpp_dart/llama_cpp_dart.dart';
+
+import 'chat_store.dart';
 
 final class _Bubble {
   final bool user;
@@ -16,11 +19,35 @@ final class _Bubble {
 
 /// The multimodal chat surface: attach images straight from the local file
 /// system and stream the model's answer.
+///
+/// When [restoreStatePath] is given the native KV state + history saved by
+/// `EngineChat.saveState()` are loaded back, and on exit the chat saves
+/// itself again (so it can be recovered from the home screen).
 class ChatPage extends StatefulWidget {
   final LlamaEngine engine;
   final String title;
 
-  const ChatPage({super.key, required this.engine, required this.title});
+  /// Absolute path of the GGUF loaded into [engine] (for the save sidecar).
+  final String? modelPath;
+
+  /// Optional mmproj used by [engine].
+  final String? mmprojPath;
+
+  /// Save-file key (model basename without `.gguf`).
+  final String? saveKey;
+
+  /// `.sstate` file to restore this chat from, or null for a fresh chat.
+  final String? restoreStatePath;
+
+  const ChatPage({
+    super.key,
+    required this.engine,
+    required this.title,
+    this.modelPath,
+    this.mmprojPath,
+    this.saveKey,
+    this.restoreStatePath,
+  });
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -35,6 +62,9 @@ class _ChatPageState extends State<ChatPage> {
   final List<String> _pendingImages = <String>[];
   bool _generating = false;
 
+  /// Guards the auto-save-on-exit flow: pop is blocked while saving.
+  bool _saving = false;
+
   bool get _visionOk => widget.engine.supportsVision;
 
   @override
@@ -46,10 +76,29 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _initChat() async {
     try {
       final chat = await widget.engine.createChat();
-      chat.addSystem(
-        'Eres un asistente útil y conciso. Cuando te den imágenes, '
-        'describelas con precisión.',
-      );
+      final restore = widget.restoreStatePath;
+      if (restore != null && File(restore).existsSync()) {
+        await chat.loadState(restore);
+        // Rebuild bubbles from the restored history. The system prompt
+        // already lives inside the saved state, so it is skipped here.
+        for (final message in chat.messages) {
+          switch (message.role) {
+            case 'user':
+              _bubbles.add(_Bubble.user(message.content, const <String>[]));
+            case 'system':
+              break;
+            case _:
+              _bubbles
+                ..add(_Bubble.assistant())
+                ..last.text = message.content;
+          }
+        }
+      } else {
+        chat.addSystem(
+          'Eres un asistente útil y conciso. Cuando te den imágenes, '
+          'describelas con precisión.',
+        );
+      }
       if (!mounted) return;
       setState(() => _chat = chat);
     } catch (e) {
@@ -62,6 +111,35 @@ class _ChatPageState extends State<ChatPage> {
     _input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  /// Pop is intercepted so the chat saves its state to disk first (native
+  /// KV + token history + message list). With >1 messages in history there
+  /// was an actual exchange worth persisting.
+  Future<void> _saveAndExit() async {
+    if (_saving) return;
+    _saving = true;
+    final chat = _chat;
+    final key = widget.saveKey;
+    try {
+      if (chat != null &&
+          key != null &&
+          key.isNotEmpty &&
+          chat.messageCount > 1) {
+        await saveChatSession(
+          chat,
+          key: key,
+          modelPath: widget.modelPath ?? '',
+          mmprojPath: widget.mmprojPath,
+          title: widget.title,
+        );
+      }
+    } catch (e) {
+      _toast('No se pudo guardar el chat: $e');
+    } finally {
+      _saving = false;
+    }
+    if (mounted) Navigator.of(context).pop();
   }
 
   void _scrollToEnd() {
@@ -164,36 +242,43 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.title, overflow: TextOverflow.ellipsis),
-        actions: [
-          Tooltip(
-            message: _visionOk
-                ? 'Visión disponible (mmproj cargado)'
-                : 'Sin mmproj: solo texto',
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Icon(
-                _visionOk ? Icons.image : Icons.image_not_supported,
-                color: _visionOk ? null : Theme.of(context).colorScheme.error,
+    return PopScope(
+      canPop: !_saving,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        unawaited(_saveAndExit());
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(widget.title, overflow: TextOverflow.ellipsis),
+          actions: [
+            Tooltip(
+              message: _visionOk
+                  ? 'Visión disponible (mmproj cargado)'
+                  : 'Sin mmproj: solo texto',
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Icon(
+                  _visionOk ? Icons.image : Icons.image_not_supported,
+                  color: _visionOk ? null : Theme.of(context).colorScheme.error,
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
+        body: _chatError != null
+            ? Center(child: Text('Error preparando el chat: $_chatError'))
+            : Column(
+                children: [
+                  Expanded(
+                    child: _chat == null
+                        ? const Center(child: CircularProgressIndicator())
+                        : _bubbleList(),
+                  ),
+                  _composer(),
+                ],
+              ),
       ),
-      body: _chatError != null
-          ? Center(child: Text('Error preparando el chat: $_chatError'))
-          : Column(
-              children: [
-                Expanded(
-                  child: _chat == null
-                      ? const Center(child: CircularProgressIndicator())
-                      : _bubbleList(),
-                ),
-                _composer(),
-              ],
-            ),
     );
   }
 

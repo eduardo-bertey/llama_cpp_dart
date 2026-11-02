@@ -8,6 +8,7 @@ library;
 
 import 'dart:io';
 
+import 'app_paths.dart';
 import 'hf_models.dart';
 
 final class HfDownloadProgress {
@@ -38,6 +39,20 @@ final class HfDownloadCanceled implements Exception {
   const HfDownloadCanceled();
 }
 
+/// Result of parsing a pasted HuggingFace GGUF link.
+final class HfUrlParse {
+  final String repo;
+
+  /// `.gguf` file name inside [repo].
+  final String fileName;
+
+  const HfUrlParse({required this.repo, required this.fileName});
+
+  bool get isOk => repo.isNotEmpty && fileName.isNotEmpty;
+
+  static const bad = HfUrlParse(repo: '', fileName: '');
+}
+
 final class HfDownloader {
   /// Target folder for downloads. Mutable: the setup page lets the user
   /// pick a destination before confirming a download.
@@ -53,10 +68,65 @@ final class HfDownloader {
     _client.connectionTimeout = const Duration(minutes: 2);
   }
 
-  static String _defaultModelsDir() {
-    final userHome =
-        Platform.environment['USERPROFILE'] ?? Directory.systemTemp.path;
-    return '$userHome\\OpenMoe\\models';
+  static String _defaultModelsDir() => AppPaths.resolveModelsDir;
+
+  /// Parse `https://huggingface.co/<owner>/<repo>/blob|resolve/<branch>/<file>.gguf`
+  /// (scheme optional, query like `?download=true` ignored). Returns a
+  /// parse whose [HfUrlParse.isOk] is false when the link isn't recognized.
+  static HfUrlParse parseHfUrl(String raw) {
+    var text = raw.trim();
+    if (text.isEmpty) return HfUrlParse.bad;
+    text = text.replaceFirst(RegExp(r'^https?://', caseSensitive: false), '');
+    text = text.replaceFirst(RegExp(r'^www\.', caseSensitive: false), '');
+    // Drop query/fragment.
+    final cut = RegExp('[?#]').firstMatch(text);
+    if (cut != null) text = text.substring(0, cut.start);
+
+    final hostPat = 'huggingface\\.co/';
+    if (!text.startsWith(hostPat)) return HfUrlParse.bad;
+    final rest = text.substring(hostPat.length);
+
+    // <owner>/<repo>/<blob|resolve>/<branch>/<name>.gguf
+    final match = RegExp(
+      r'^([^/]+)/([^/]+)/(?:blob|resolve)/[^/]+/(.+\.gguf)$',
+      caseSensitive: false,
+    ).firstMatch(rest);
+    if (match == null) return HfUrlParse.bad;
+    final file = match.group(3)!;
+    if (!file.toLowerCase().endsWith('.gguf')) return HfUrlParse.bad;
+    return HfUrlParse(
+      repo: '${match.group(1)}/${match.group(2)}',
+      fileName: file,
+    );
+  }
+
+  /// Download the GGUF a pasted [rawUrl] points at, into [destDirectory].
+  /// Size is unknown until the server answers, so the progress bar uses
+  /// content-length when available.
+  Future<String> downloadUrl(
+    String rawUrl, {
+    required void Function(HfDownloadProgress) onProgress,
+  }) async {
+    final parsed = parseHfUrl(rawUrl);
+    if (!parsed.isOk) {
+      throw const FormatException('Link de HuggingFace no válido');
+    }
+    final file = HfFile(parsed.fileName);
+    final dir = destDir;
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return _downloadOne(
+      repo: parsed.repo,
+      file: file,
+      withProgress: (received, total) => onProgress(
+        HfDownloadProgress(
+          file: file,
+          filesCompleted: 0,
+          filesTotal: 1,
+          receivedBytes: received,
+          totalBytes: total,
+        ),
+      ),
+    );
   }
 
   Directory get destDir => Directory(destDirectory);
