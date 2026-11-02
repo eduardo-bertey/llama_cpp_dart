@@ -13,6 +13,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - uses: subosito/flutter-action@v2
         with:
@@ -20,6 +22,24 @@ jobs:
 
       - name: dart pub get
         run: dart pub get
+
+      - name: ensure libclang available (needed by ffigen)
+        run: |
+          if (-not (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) {
+            choco install llvm -y --no-progress
+            Add-Content $env:GITHUB_PATH 'C:\Program Files\LLVM\bin'
+          }
+          Write-Host "llama.cpp vendored at: $(git -C src\llama.cpp describe --tags --always)"
+
+      # Regenerate bindings from the vendored llama.cpp headers (b12050) so
+      # the FFI structs match the shipped release DLLs exactly — the old
+      # committed bindings were generated from b10182 and lacked fields
+      # (e.g. llama_model_params.lazy_mode) → 4-byte struct mismatch →
+      # access violation inside llama.dll at llama_model_load_from_file.
+      - name: regenerate bindings (ffigen) from vendored headers
+        run: |
+          dart run ffigen
+          dart format lib\src\ffi\bindings.dart
 
       - name: dart analyze
         run: dart analyze

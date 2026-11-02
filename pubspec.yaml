@@ -22,7 +22,7 @@ dev_dependencies:
 
 ffigen:
   name: 'LlamaBindings'
-  description: 'Raw FFI bindings for llama.cpp (llama.h + mtmd.h). Do not edit by hand.'
+  description: 'Raw FFI bindings for llama.cpp (llama.h + mtmd.h). Do not edit by hand — CI regenerates this file from the vendored headers.'
   output: 'lib/src/ffi/bindings.dart'
   headers:
     entry-points:
@@ -30,7 +30,6 @@ ffigen:
       - 'src/llama.cpp/tools/mtmd/mtmd.h'
       - 'src/llama.cpp/tools/mtmd/mtmd-helper.h'
   compiler-opts:
-    - '-resource-dir=/Library/Developer/CommandLineTools/usr/lib/clang/21'
     - '-Isrc/llama.cpp/ggml/include'
     - '-Isrc/llama.cpp/include'
     - '-Isrc/llama.cpp/tools/mtmd'
