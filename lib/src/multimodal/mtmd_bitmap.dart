@@ -75,13 +75,16 @@ final class MtmdBitmap implements Finalizable {
   }) {
     final pathPtr = path.toNativeUtf8();
     try {
-      // placeholder=false: decode the real bitmap now (the video-aware helper
-      // returns a wrapper carrying the bitmap and an optional video context;
-      // we only use the bitmap for image/audio inputs).
+      // placeholder=false + default video opts: decode the real bitmap now
+      // (the video-aware helper returns a wrapper carrying the bitmap and
+      // an optional video context; we only use the bitmap for image/audio
+      // inputs).
+      final opt = LlamaLibrary.bindings.mtmd_helper_init_opt_default();
       final wrapper = LlamaLibrary.bindings.mtmd_helper_bitmap_init_from_file(
         context.pointer,
         pathPtr.cast<Char>(),
         false,
+        opt,
       );
       final ptr = wrapper.bitmap;
       if (ptr == nullptr) {
@@ -107,6 +110,7 @@ final class MtmdBitmap implements Finalizable {
         buf,
         bytes.length,
         false,
+        LlamaLibrary.bindings.mtmd_helper_init_opt_default(),
       );
       final ptr = wrapper.bitmap;
       if (ptr == nullptr) {

@@ -127,6 +127,7 @@ final class MultimodalContext implements Finalizable {
               buf,
               m.bytes.length,
               false,
+              b.mtmd_helper_init_opt_default(),
             )
             .bitmap;
         if (bm == nullptr) {

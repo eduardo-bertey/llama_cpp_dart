@@ -69,9 +69,15 @@ final class SamplerFactory {
         params.frequencyPenalty != 0.0 ||
         params.presencePenalty != 0.0;
     if (hasPenalty) {
+      final nVocab = model == null
+          ? throw StateError(
+              'SamplerFactory.build: penalties requires a model (n_vocab).',
+            )
+          : b.llama_vocab_n_tokens(model.vocab.pointer);
       b.llama_sampler_chain_add(
         chain,
         b.llama_sampler_init_penalties(
+          nVocab,
           params.penaltyLastN,
           params.repeatPenalty,
           params.frequencyPenalty,
@@ -82,7 +88,6 @@ final class SamplerFactory {
 
     if (params.dry.enabled) {
       final vocab = requireVocab('DRY sampler');
-      final m = model!;
       final breakers = params.dry.seqBreakers;
       final breakerPtrs = calloc<Pointer<Char>>(
         breakers.isEmpty ? 1 : breakers.length,
@@ -97,7 +102,6 @@ final class SamplerFactory {
         chain,
         b.llama_sampler_init_dry(
           vocab,
-          m.trainCtx,
           params.dry.multiplier,
           params.dry.base,
           params.dry.allowedLength,

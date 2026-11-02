@@ -36,6 +36,8 @@ final class MtmdChunk {
       mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_TEXT => MtmdChunkKind.text,
       mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_IMAGE => MtmdChunkKind.image,
       mtmd_input_chunk_type.MTMD_INPUT_CHUNK_TYPE_AUDIO => MtmdChunkKind.audio,
+      // MTMD_INPUT_CHUNK_TYPE_COUNT is a sentinel, not a real payload kind.
+      _ => MtmdChunkKind.text,
     };
   }
 
