@@ -84,17 +84,32 @@ final class LlamaLibrary {
 
   /// Load the native library and initialize llama / ggml backends.
   ///
-  /// [path] is the absolute path to `libllama.dylib` / `libllama.so`.
+  /// [path] is the path to `libllama.dylib` / `libllama.so`. Anything that
+  /// looks like a file path (contains a separator) is canonicalized to its
+  /// absolute form — required on Windows, where relative paths pair badly
+  /// with the loader flags Dart uses. A bare library name (no separator)
+  /// stays untouched and is resolved by the OS (Android jniLibs, PATH, …).
   /// [backendDirectory] points at the directory holding the ggml backend
   /// dylibs (`libggml-metal.dylib`, `libggml-cpu.dylib`, ...). Defaults to
   /// the directory containing [path].
   ///
-  /// Idempotent: subsequent calls with the same [path] are no-ops.
+  /// Idempotent: subsequent calls with the same path are no-ops.
   /// Calling with a different path while a library is already loaded
   /// throws [LlamaLibraryException].
   static void load({required String path, String? backendDirectory}) {
+    // Windows note: Dart opens libraries through LoadLibraryExW with the
+    // LOAD_WITH_ALTERED_SEARCH_PATH flag, whose behavior is *undefined* for
+    // relative paths — dependencies of the DLL (ggml-base.dll & co.) may not
+    // resolve at all, yielding "The specified module could not be found"
+    // (error 126). Canonicalize anything that looks like a file path to its
+    // absolute form; a bare library name keeps flowing to the OS search
+    // machinery untouched.
+    final openPath = (path.contains('/') || path.contains('\\'))
+        ? File(path).absolute.path
+        : path;
+
     if (_bindings != null) {
-      if (_libraryPath == path) return;
+      if (_libraryPath == openPath) return;
       throw LlamaLibraryException(
         'A different llama library is already loaded: $_libraryPath',
       );
@@ -109,13 +124,13 @@ final class LlamaLibrary {
       // not be found" (error 126) is what a missing directory produces.
       // Point the fallback search slot at the llama.dll folder first, e.g.
       // the unpacked `llama-b*-bin-win-cpu-x64` release.
-      final searchDir = _dirOf(path);
+      final searchDir = _dirOf(openPath);
       if (Platform.isWindows && searchDir != null) {
         _setWindowsSearchDirectory(searchDir);
       }
-      llama = DynamicLibrary.open(path);
+      llama = DynamicLibrary.open(openPath);
     } on ArgumentError catch (e) {
-      throw LlamaLibraryException('failed to open $path: $e');
+      throw LlamaLibraryException('failed to open $openPath: $e');
     }
     _llamaLib = llama;
 
@@ -124,13 +139,13 @@ final class LlamaLibrary {
     // `mtmd_` are routed to this handle when the lookup runs.
     //
     // Resolution rules:
-    //   1. If [path] is a basename (no slash), assume the OS will resolve
+    //   1. If [openPath] is a basename (no slash), assume the OS will resolve
     //      libraries by name from the app's lib path (Android jniLibs,
     //      Linux LD_LIBRARY_PATH). Open libmtmd by basename too.
     //   2. Otherwise look in the same directory as libllama (or the
     //      explicit [backendDirectory] override) and open by full path.
     DynamicLibrary? mtmd;
-    final dir = backendDirectory ?? _dirOf(path);
+    final dir = backendDirectory ?? _dirOf(openPath);
     final mtmdName = _mtmdFileName();
     if (mtmdName != null) {
       if (dir == null) {
@@ -167,7 +182,7 @@ final class LlamaLibrary {
     //
     // Only Windows populates it; other platforms keep symbol resolution
     // unchanged.
-    final llamaDir = _dirOf(path);
+    final llamaDir = _dirOf(openPath);
     if (Platform.isWindows &&
         llamaDir != null &&
         !_canLookup<NativeFunction<Void Function()>>(
@@ -186,7 +201,7 @@ final class LlamaLibrary {
     // is the directory holding the loaded `libllama.so` — discovered from
     // `/proc/self/maps` when [path] was a basename.
     if (Platform.isAndroid) {
-      final adspDir = dir ?? _resolveAndroidLibraryDir(path);
+      final adspDir = dir ?? _resolveAndroidLibraryDir(openPath);
       if (adspDir != null) {
         _setAdspLibraryPath(adspDir);
       }
@@ -204,9 +219,10 @@ final class LlamaLibrary {
     }
 
     _bindings = bindings;
-    _libraryPath = path;
+    _libraryPath = openPath;
     _libraryDir =
-        dir ?? (Platform.isAndroid ? _resolveAndroidLibraryDir(path) : null);
+        dir ??
+        (Platform.isAndroid ? _resolveAndroidLibraryDir(openPath) : null);
   }
 
   /// True when the optional libmtmd dylib was successfully opened
