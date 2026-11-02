@@ -39,7 +39,9 @@ final class HfDownloadCanceled implements Exception {
 }
 
 final class HfDownloader {
-  final String destDirectory;
+  /// Target folder for downloads. Mutable: the setup page lets the user
+  /// pick a destination before confirming a download.
+  String destDirectory;
   final HttpClient _client;
   final List<bool> _canceled = <bool>[false];
 

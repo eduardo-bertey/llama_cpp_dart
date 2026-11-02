@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
@@ -5,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:llama_cpp_dart/llama_cpp_dart.dart';
 
 import 'chat_page.dart';
+import 'crash_log.dart';
 import 'hf_download.dart';
 import 'hf_models.dart';
 import 'system_info.dart';
@@ -12,7 +14,9 @@ import 'system_info.dart';
 /// Launcher screen: library path, model catalog with download + confirmation,
 /// then into the chat once the engine is live.
 class SetupPage extends StatefulWidget {
-  const SetupPage({super.key});
+  final String? lastSessionCrash;
+
+  const SetupPage({super.key, this.lastSessionCrash});
 
   @override
   State<SetupPage> createState() => _SetupPageState();
@@ -31,9 +35,13 @@ class _SetupPageState extends State<SetupPage> {
   @override
   void initState() {
     super.initState();
-    final home = Platform.environment['USERPROFILE'] ?? r'C:\';
+    // The bundled zip ships the llama.cpp DLLs right beside the executable,
+    // so the only built-in detection is "next to this exe". Anything else is
+    // picked by hand via the file picker (the field stays editable).
+    final exeDir = Directory(File(Platform.resolvedExecutable).parent.path);
+    final besideExe = '${exeDir.path}\\llama.dll';
     _libController = TextEditingController(
-      text: '$home\\Desktop\\llama\\llama.dll',
+      text: File(besideExe).existsSync() ? besideExe : '',
     );
     _downloader = HfDownloader();
     // Preselect the first catalog model whose files are already on disk;
@@ -45,6 +53,27 @@ class _SetupPageState extends State<SetupPage> {
         orElse: () => hfCatalog.first,
       ),
     );
+    // If the previous session crashed, say so with the captured error
+    // instead of pretending nothing happened.
+    if (widget.lastSessionCrash != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        showDialog<void>(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: const Text('Error desde la última sesión'),
+            content: SingleChildScrollView(
+              child: SelectableText(widget.lastSessionCrash!),
+            ),
+            actions: [
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Cerrar'),
+              ),
+            ],
+          ),
+        );
+      });
+    }
   }
 
   @override
@@ -325,33 +354,68 @@ class _SetupPageState extends State<SetupPage> {
     if (entry.mmprojFile != null) {
       filesText.writeln('• ${entry.mmprojFile!.name}\n');
     }
+    var dest = _downloader.destDirectory;
     final ok = await showDialog<bool>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('¿Descargar este modelo?'),
-        content: Text(
-          'Se descargará desde HuggingFace:\n\n'
-          '${entry.repo}\n'
-          '$filesText\n'
-          'Tamaño aproximado: ${humanSize(entry.approxBytes)}\n'
-          'Destino: ${_downloader.destDirectory}\n\n'
-          'La descarga admite pausa/reanudación (continúa desde donde quedó '
-          'si cancelas o se corta la conexión).',
-          softWrap: true,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('¿Descargar este modelo?'),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'Se descargará desde HuggingFace:\n\n'
+                  '${entry.repo}\n'
+                  '$filesText\n'
+                  'Tamaño aproximado: ${humanSize(entry.approxBytes)}',
+                  softWrap: true,
+                ),
+                const SizedBox(height: 12),
+                const Text('Carpeta de destino:'),
+                Text(
+                  dest,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                TextButton.icon(
+                  onPressed: () async {
+                    final picked = await getDirectoryPath(
+                      initialDirectory: Directory(dest).existsSync()
+                          ? dest
+                          : null,
+                    );
+                    if (picked != null && picked.isNotEmpty) {
+                      setDialogState(() => dest = picked);
+                    }
+                  },
+                  icon: const Icon(Icons.folder_open, size: 16),
+                  label: const Text('Elegir otra carpeta…'),
+                ),
+                const Text(
+                  'La descarga admite pausa/reanudación (continúa desde '
+                  'donde quedó si cancelas o se corta la conexión).',
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Descargar'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Cancelar'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('Descargar'),
-          ),
-        ],
       ),
     );
     if (ok != true) return;
+    _downloader.destDirectory = dest;
 
     _downloader.resetCancelled();
     setState(() => _downloading = true);
@@ -415,6 +479,16 @@ class _SetupPageState extends State<SetupPage> {
       return;
     }
 
+    // Breadcrumbs: if the native side segfaults during spawn, the process
+    // dies without any exception — this is the only trace we can leave.
+    unawaited(
+      appendCrashLog(
+        'engine-spawn: dll=$dll\n'
+        '             model=$modelPath\n'
+        '             mmproj=$mmprojPath',
+      ),
+    );
+
     setState(() => _booting = true);
     try {
       final engine = await LlamaEngine.spawn(
@@ -432,14 +506,16 @@ class _SetupPageState extends State<SetupPage> {
             ? MultimodalParams(mmprojPath: mmprojPath)
             : null,
       );
+      unawaited(appendCrashLog('engine-spawn: OK, entrando al chat'));
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
           builder: (_) => ChatPage(engine: engine, title: title),
         ),
       );
-    } catch (e) {
+    } catch (e, st) {
       setState(() => _booting = false);
+      unawaited(appendCrashLog('engine-spawn FAILED: $e\n$st'));
       if (mounted) {
         await showDialog<void>(
           context: context,

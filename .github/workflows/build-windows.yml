@@ -25,7 +25,7 @@ jobs:
         run: dart analyze
 
       - name: dart format check
-        run: dart format --output=none --set-exit-if-changed lib tool/probe_windows_dlls.dart
+        run: dart format --output=none --set-exit-if-changed lib tool/probe_windows_dlls.dart tool/smoke_windows_model.dart
 
       - name: pure-dart tests
         run: |
@@ -48,6 +48,16 @@ jobs:
 
       - name: loader probe against the real DLLs
         run: dart run tool/probe_windows_dlls.dart build\win-libs
+
+      - name: download smoke model (Qwen3.5-0.8B Q4_0, ~563 MB)
+        run: |
+          New-Item -ItemType Directory -Force build\smoke-model | Out-Null
+          Invoke-WebRequest `
+            -Uri 'https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_0.gguf' `
+            -OutFile build\smoke-model\Qwen3.5-0.8B-Q4_0.gguf
+
+      - name: ABI smoke — load real model with the real DLLs
+        run: dart run tool/smoke_windows_model.dart build\win-libs build\smoke-model\Qwen3.5-0.8B-Q4_0.gguf
 
       - name: flutter pub get (app-openmoe)
         working-directory: app-openmoe

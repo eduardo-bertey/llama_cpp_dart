@@ -1,16 +1,25 @@
 /// System dashboard: CPU, RAM and GPU telemetry for the launcher screen.
 ///
-/// Data comes from three sources:
-///  * PowerShell CIM instances (Win32_Processor / Win32_OperatingSystem)
-///    for CPU model, cores, load and RAM totals;
-///  * `nvidia-smi` when present, falling back to a bare GPU name;
-///  * llama.cpp itself (`llama_print_system_info`) once the library is
-///    loaded, so CPU feature flags show what inference really uses.
+/// Read straight from the Windows API with dart:ffi — no child processes,
+/// no PowerShell, no registry access:
+///   * `GlobalMemoryStatusEx` (kernel32) → RAM totals + memory load;
+///   * `GetNativeSystemInfo` (kernel32) → logical-core count;
+///   * `GetLogicalProcessorInformationEx` (kernel32) → physical cores;
+///   * `GetProcessMemoryInfo` (psapi) → RSS of this app;
+///   * `GetSystemTimes` (kernel32) → CPU load %;
+///   * `CreateDXGIFactory1` (dxgi) → GPU name + dedicated VRAM;
+///   * llama.cpp (`systemInfo()`) for the inference-side feature flags once
+///     the library is loaded.
+///
+/// Every collector is independent and wrapped in its own try/catch: one bad
+/// piece never blanks the whole panel.
 library;
 
 import 'dart:async';
+import 'dart:ffi';
 import 'dart:io';
 
+import 'package:ffi/ffi.dart';
 import 'package:flutter/material.dart';
 import 'package:llama_cpp_dart/llama_cpp_dart.dart';
 
@@ -24,8 +33,7 @@ final class SystemSnapshot {
   final double processRssMb;
   final String gpuName;
   final double? gpuVramTotalMb;
-  final double? gpuVramUsedMb;
-  final String llamaSystemInfo;
+  final String detail;
 
   const SystemSnapshot({
     required this.cpuName,
@@ -37,22 +45,20 @@ final class SystemSnapshot {
     required this.processRssMb,
     required this.gpuName,
     required this.gpuVramTotalMb,
-    required this.gpuVramUsedMb,
-    required this.llamaSystemInfo,
+    required this.detail,
   });
 
   static const empty = SystemSnapshot(
-    cpuName: '(sin datos)',
+    cpuName: 'Procesador',
     physicalCores: 0,
     logicalCores: 0,
     cpuLoadPercent: null,
     ramTotalGb: 0,
     ramFreeGb: 0,
     processRssMb: 0,
-    gpuName: '(sin GPU detectada)',
+    gpuName: '(GPU no detectada)',
     gpuVramTotalMb: null,
-    gpuVramUsedMb: null,
-    llamaSystemInfo: '',
+    detail: '',
   );
 
   double get ramUsedGb {
@@ -70,11 +76,12 @@ final class SystemFeed {
   final StreamController<SystemSnapshot> _controller =
       StreamController.broadcast();
 
-  SystemFeed({this.interval = const Duration(seconds: 2)});
+  SystemFeed({this.interval = const Duration(seconds: 4)});
 
   Stream<SystemSnapshot> get stream => _controller.stream;
 
   void start() {
+    _timer?.cancel();
     _sample();
     _timer = Timer.periodic(interval, (_) => _sample());
   }
@@ -86,120 +93,402 @@ final class SystemFeed {
     _controller.close();
   }
 
-  Future<void> _sample() async {
+  void _sample() {
     try {
-      final snapshot = await collect();
-      if (!_controller.isClosed) _controller.add(snapshot);
-    } on ProcessException {
-      // Keep the last values; the panel tolerates missing tools.
+      if (!_controller.isClosed) _controller.add(collect());
+    } catch (_) {
+      // Keep the last values; the panel tolerates flaky queries.
     }
   }
 }
 
-Future<SystemSnapshot> collect() async {
-  final cpuRamLines = (await _queryCpuRam())?.split('|') ?? const <String>[];
-  final gpuInfo = await _queryGpu();
-  final llamaInfo = LlamaLibrary.isLoaded
-      ? LlamaLibrary.systemInfo().trim()
-      : '';
+// ── CPU-load delta state (GetSystemTimes is cumulative) ──────────────────────
 
-  String pick(int index, String fallback) =>
-      index < cpuRamLines.length ? cpuRamLines[index] : fallback;
+_FileTimeBox? _prevTimes;
+
+typedef _FileTimeBox = ({int idle, int kernel, int user});
+
+/// Collect a fresh snapshot. Never throws for missing pieces; whatever the
+/// OS answers is what the panel shows.
+SystemSnapshot collect() {
+  var physicalCores = 0;
+  var logicalCores = 0;
+  var ramTotalGb = 0.0;
+  var ramFreeGb = 0.0;
+  var processRssMb = 0.0;
+  double? cpuLoadPercent;
+  final gpuParts = <String>[];
+  double? gpuVramTotalMb;
+
+  if (Platform.isWindows) {
+    try {
+      final mem = _globalMemoryStatus();
+      ramTotalGb = mem.$1 / (1024 * 1024 * 1024);
+      ramFreeGb = mem.$2 / (1024 * 1024 * 1024);
+    } catch (_) {}
+
+    try {
+      final counts = _processorCounts();
+      physicalCores = counts.$1;
+      logicalCores = counts.$2;
+    } catch (_) {}
+
+    try {
+      final rss = _currentProcessRss();
+      if (rss != null) processRssMb = rss / (1024 * 1024);
+    } catch (_) {}
+
+    try {
+      final load = _cpuLoadPercent();
+      if (load != null) cpuLoadPercent = load;
+    } catch (_) {}
+
+    try {
+      final gpus = _dxgiAdapters();
+      if (gpus.isNotEmpty) {
+        gpuParts.addAll(gpus.map((g) => g.$1));
+        gpuVramTotalMb = gpus.first.$2 / (1024 * 1024);
+      }
+    } catch (_) {}
+  }
+
+  String llamaInfo = '';
+  try {
+    llamaInfo = LlamaLibrary.isLoaded ? LlamaLibrary.systemInfo().trim() : '';
+  } catch (_) {}
 
   return SystemSnapshot(
-    cpuName: pick(0, '(sin datos)'),
-    physicalCores: int.tryParse(pick(1, '0')) ?? 0,
-    logicalCores: int.tryParse(pick(2, '0')) ?? 0,
-    cpuLoadPercent: double.tryParse(pick(3, '')),
-    ramTotalGb: _numOrZero(pick(4, '0')),
-    ramFreeGb: _numOrZero(pick(5, '0')),
-    processRssMb: _numOrZero(pick(6, '0')),
-    gpuName: (gpuInfo['name'] as String?) ?? '(sin GPU detectada)',
-    gpuVramTotalMb: gpuInfo['totalMb'] as double?,
-    gpuVramUsedMb: gpuInfo['usedMb'] as double?,
-    llamaSystemInfo: llamaInfo,
+    cpuName: 'Procesador',
+    physicalCores: physicalCores,
+    logicalCores: logicalCores,
+    cpuLoadPercent: cpuLoadPercent,
+    ramTotalGb: ramTotalGb,
+    ramFreeGb: ramFreeGb,
+    processRssMb: processRssMb,
+    gpuName: gpuParts.isEmpty ? '(GPU no detectada)' : gpuParts.join(' / '),
+    gpuVramTotalMb: gpuVramTotalMb,
+    detail: llamaInfo,
   );
 }
 
-double _numOrZero(String raw) => double.tryParse(raw) ?? 0;
+// ─── kernel32 ────────────────────────────────────────────────────────────────
 
-/// Output is pipe-separated:
-/// name|physicalCores|logicalCores|load%|ramTotalGb|ramFreeGb|rssMb
-Future<String?> _queryCpuRam() async {
-  final script = _cpuRamScript(pid);
-  final result = await Process.run('powershell.exe', [
-    '-NoProfile',
-    '-NonInteractive',
-    '-Command',
-    script,
-  ]);
-  final out = (result.stdout as String?)?.trim() ?? '';
-  if (out.isEmpty) {
-    throw StateError(result.stderr as String? ?? 'PowerShell sin salida');
-  }
-  // The CPU name could theoretically include pipes; the formatted result is
-  // the only non-empty line, so always pick the first non-empty line.
-  for (final line in out.split('\n')) {
-    final trimmed = line.trim();
-    if (trimmed.isNotEmpty) return trimmed;
-  }
-  return null;
+final DynamicLibrary? _kernel32 = Platform.isWindows
+    ? DynamicLibrary.open('kernel32.dll')
+    : null;
+
+final class _MemoryStatusEx extends Struct {
+  @Uint32()
+  external int dwLength;
+
+  @Uint32()
+  external int dwMemoryLoad;
+
+  @Uint64()
+  external int ullTotalPhys;
+
+  @Uint64()
+  external int ullAvailPhys;
+
+  @Uint64()
+  external int ullTotalPageFile;
+
+  @Uint64()
+  external int ullAvailPageFile;
+
+  @Uint64()
+  external int ullTotalVirtual;
+
+  @Uint64()
+  external int ullAvailVirtual;
+
+  @Uint64()
+  external int ullAvailExtendedVirtual;
 }
 
-String _cpuRamScript(int dartPid) {
-  return r'''
-$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-$os = Get-CimInstance Win32_OperatingSystem
-$proc = Get-Process -Id @DARTPID@
-Write-Output ('{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f @(
-  $cpu.Name.Trim(),
-  $cpu.NumberOfCores,
-  $cpu.NumberOfLogicalProcessors,
-  $cpu.LoadPercentage,
-  [math]::Round($os.TotalVisibleMemorySize / 1MB, 1),
-  [math]::Round($os.FreePhysicalMemory / 1MB, 1),
-  [math]::Round($proc.WorkingSet64 / 1MB, 1)
-))
-'''
-      .replaceFirst('@DARTPID@', '$dartPid');
+final class _SystemInfoStruct extends Struct {
+  @Uint16()
+  external int wProcessorArchitecture;
+
+  @Uint16()
+  external int wReserved;
+
+  @Uint32()
+  external int dwPageSize;
+
+  external Pointer<Void> lpMinimumApplicationAddress;
+
+  external Pointer<Void> lpMaximumApplicationAddress;
+
+  @UintPtr()
+  external int dwActiveProcessorMask;
+
+  @Uint32()
+  external int dwNumberOfProcessors;
+
+  @Uint32()
+  external int dwProcessorType;
+
+  @Uint32()
+  external int dwAllocationGranularity;
+
+  @Uint16()
+  external int wProcessorLevel;
+
+  @Uint16()
+  external int wProcessorRevision;
 }
 
-/// nvidia-smi (precise VRAM for NVIDIA GPUs) else nothing but the name.
-Future<Map<String, Object?>> _queryGpu() async {
-  final smi = await Process.run('nvidia-smi', const [
-    '--query-gpu=name,memory.total,memory.used',
-    '--format=csv,noheader,nounits',
-  ]);
-  if (smi.exitCode == 0) {
-    final line = (smi.stdout as String?)
-        ?.split('\n')
-        .map((l) => l.trim())
-        .firstWhere((l) => l.isNotEmpty, orElse: () => '');
-    if (line != null && line.isNotEmpty) {
-      final parts = line.split(',');
-      if (parts.length >= 3) {
-        return <String, Object?>{
-          'name': parts[0].trim(),
-          'totalMb': double.tryParse(parts[1].trim()),
-          'usedMb': double.tryParse(parts[2].trim()),
-        };
+/// (totalBytes, availableBytes) via GlobalMemoryStatusEx.
+(int, int) _globalMemoryStatus() {
+  final k32 = _kernel32!;
+  final gms = k32
+      .lookupFunction<
+        Int32 Function(Pointer<_MemoryStatusEx>),
+        int Function(Pointer<_MemoryStatusEx>)
+      >('GlobalMemoryStatusEx');
+  final ms = calloc<_MemoryStatusEx>();
+  ms.ref.dwLength = sizeOf<_MemoryStatusEx>();
+  final result = gms(ms);
+  final total = ms.ref.ullTotalPhys;
+  final avail = ms.ref.ullAvailPhys;
+  calloc.free(ms);
+  if (result == 0) {
+    throw StateError('GlobalMemoryStatusEx failed');
+  }
+  return (total, avail);
+}
+
+/// (physicalCores, logicalCores). Logical count from GetNativeSystemInfo
+/// (cheap); physical from GetLogicalProcessorInformationEx — best effort.
+(int, int) _processorCounts() {
+  final k32 = _kernel32!;
+  final gsi = k32
+      .lookupFunction<
+        Void Function(Pointer<_SystemInfoStruct>),
+        void Function(Pointer<_SystemInfoStruct>)
+      >('GetNativeSystemInfo');
+  final si = calloc<_SystemInfoStruct>();
+  gsi(si);
+  final logical = si.ref.dwNumberOfProcessors;
+  calloc.free(si);
+
+  var physical = 0;
+  try {
+    final glpie = k32
+        .lookupFunction<
+          Int32 Function(Int32, Pointer<Void>, Pointer<Uint32>),
+          int Function(int, Pointer<Void>, Pointer<Uint32>)
+        >('GetLogicalProcessorInformationEx');
+    final needed = calloc<Uint32>();
+    // RelationAll = 0xFFFF; first call just asks for the buffer size
+    // (returns 0 with ERROR_INSUFFICIENT_BUFFER = 122).
+    glpie(0xFFFF, nullptr, needed);
+    final buf = calloc<Uint8>(needed.value);
+    final ok = glpie(0xFFFF, buf.cast<Void>(), needed) != 0;
+    if (ok) {
+      // SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX entries start with
+      // { DWORD Relationship; DWORD Size; <payload> }.
+      var offset = 0;
+      final size = needed.value;
+      while (offset + 8 <= size) {
+        final rel = (buf + offset).cast<Uint32>();
+        final len = (buf + offset + 4).cast<Uint32>();
+        if (len.value < 8) break;
+        // RelationProcessorCore = 0.
+        if (rel.value == 0) physical++;
+        offset += len.value;
       }
     }
+    calloc.free(buf);
+    calloc.free(needed);
+  } catch (_) {
+    physical = 0;
   }
-  // No NVIDIA tooling: at least name the adapter(s).
-  final vc = await Process.run('powershell.exe', [
-    '-NoProfile',
-    '-NonInteractive',
-    '-Command',
-    '(Get-CimInstance Win32_VideoController).Name -join \', \'',
-  ]).catchError((_) => ProcessResult(0, 1, '', ''));
-  final name = (vc.stdout as String?)?.trim();
-  return <String, Object?>{
-    'name': (name?.isEmpty ?? true) ? null : name,
-    'totalMb': null,
-    'usedMb': null,
-  };
+
+  return (physical, logical);
 }
+
+/// RSS of this process in bytes, via psapi GetProcessMemoryInfo.
+int? _currentProcessRss() {
+  if (!Platform.isWindows) return null;
+  final psapi = DynamicLibrary.open('psapi.dll');
+  final gpmi = psapi
+      .lookupFunction<
+        Int32 Function(IntPtr, Pointer<Uint8>, Uint32),
+        int Function(int, Pointer<Uint8>, int)
+      >('GetProcessMemoryInfo');
+  // GetCurrentProcess() pseudo-handle is (HANDLE)-1 for the Win64 ABI.
+  final buf = calloc<Uint8>(256);
+  final ok = gpmi(-1, buf, 256) != 0;
+  if (!ok) {
+    calloc.free(buf);
+    return null;
+  }
+  // PROCESS_MEMORY_COUNTERS x64: cb(0), PageFaultCount(4),
+  // PeakWorkingSetSize(8), WorkingSetSize(16) …
+  final rss = (buf + 16).cast<UintPtr>().value;
+  calloc.free(buf);
+  return rss;
+}
+
+/// CPU load percent from GetSystemTimes deltas.
+///
+/// NOTE: on Windows the kernel counter *includes* idle time, so
+/// load = ((kernel+user) − idle) / (kernel+user). First call has no previous
+/// sample and returns null; the panel handles that.
+double? _cpuLoadPercent() {
+  final k32 = _kernel32!;
+  final gst = k32
+      .lookupFunction<
+        Int32 Function(Pointer<Uint64>, Pointer<Uint64>, Pointer<Uint64>),
+        int Function(Pointer<Uint64>, Pointer<Uint64>, Pointer<Uint64>)
+      >('GetSystemTimes');
+  final idle = calloc<Uint64>();
+  final kernel = calloc<Uint64>();
+  final user = calloc<Uint64>();
+  final ok = gst(idle, kernel, user) != 0;
+  final i = idle.value;
+  final k = kernel.value;
+  final u = user.value;
+  calloc.free(idle);
+  calloc.free(kernel);
+  calloc.free(user);
+  if (!ok) return null;
+
+  final prev = _prevTimes;
+  _prevTimes = (idle: i, kernel: k, user: u);
+  if (prev == null) return null;
+
+  final idleDelta = (i - prev.idle).abs();
+  final totalDelta = (k - prev.kernel).abs() + (u - prev.user).abs();
+  if (totalDelta == 0) return null;
+  final percent = (totalDelta - idleDelta) / totalDelta * 100.0;
+  if (percent < 0) return 0;
+  if (percent > 100) return 100;
+  return double.parse(percent.toStringAsFixed(1));
+}
+
+// ─── dxgi (COM — GPU name + dedicated VRAM) ─────────────────────────────────
+
+typedef _EnumAdapters1Native = Int32 Function(
+  Pointer<Void> self,
+  Uint32 index,
+  Pointer<Pointer<Void>> adapterOut,
+);
+typedef _EnumAdapters1Dart = int Function(
+  Pointer<Void> self,
+  int index,
+  Pointer<Pointer<Void>> adapterOut,
+);
+
+typedef _GetDesc1Native = Int32 Function(
+  Pointer<Void> self,
+  Pointer<Uint8> desc,
+);
+typedef _GetDesc1Dart = int Function(Pointer<Void> self, Pointer<Uint8> desc);
+
+typedef _CreateDxgiFactory1Native = Int32 Function(
+  Pointer<Uint8> riid,
+  Pointer<Pointer<Void>> factoryOut,
+);
+typedef _CreateDxgiFactory1Dart = int Function(
+  Pointer<Uint8> riid,
+  Pointer<Pointer<Void>> factoryOut,
+);
+
+/// IID_IDXGIFactory1 {770AAE78-F26F-4DBA-A829-253C83D1B387}, little-endian.
+const List<int> _iidFactory1 = [
+  0x78, 0xae, 0x0a, 0x77, 0x6f, 0xf2, 0xba, 0x4d, //
+  0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87,
+];
+
+/// Enumerate GPUs through DXGI. Returns (name, dedicatedVramBytes).
+List<(String, int)> _dxgiAdapters() {
+  final DynamicLibrary dxgi;
+  try {
+    dxgi = DynamicLibrary.open('dxgi.dll');
+  } catch (_) {
+    return const [];
+  }
+
+  final createFactory = dxgi
+      .lookupFunction<_CreateDxgiFactory1Native, _CreateDxgiFactory1Dart>(
+        'CreateDXGIFactory1',
+      );
+  final factoryOut = calloc<Pointer<Void>>();
+  final riid = calloc<Uint8>(16);
+  for (var i = 0; i < 16; i++) {
+    riid[i] = _iidFactory1[i];
+  }
+  final hr = createFactory(riid, factoryOut);
+  calloc.free(riid);
+  if (hr != 0 || factoryOut.value == nullptr) {
+    calloc.free(factoryOut);
+    return const [];
+  }
+  final factory = factoryOut.value;
+  calloc.free(factoryOut);
+
+  final results = <(String, int)>[];
+  try {
+    // COM vtable: IUnknown(0..2) · IDXGIObject(3..6) · IDXGIFactory(7..10)
+    // · idxgifactory1::EnumAdapters1 = 11.
+    final factoryVtable = factory
+        .cast<Pointer<Pointer<NativeFunction<_EnumAdapters1Native>>>>()
+        .value;
+    final enumAdapters1 = factoryVtable[11].asFunction<_EnumAdapters1Dart>();
+    for (var index = 0; index < 8; index++) {
+      final adapterOut = calloc<Pointer<Void>>();
+      final r = enumAdapters1(factory, index, adapterOut);
+      final adapter = adapterOut.value;
+      calloc.free(adapterOut);
+      if (r != 0 || adapter == nullptr) break;
+      try {
+        // idxgiadapter::EnumOutputs(7) GetDesc(8) CheckInterfaceSupport(9)
+        // · idxgiadapter1::GetDesc1 = 10.
+        final adapterVtable = adapter
+            .cast<Pointer<Pointer<NativeFunction<_GetDesc1Native>>>>()
+            .value;
+        final getDesc1 = adapterVtable[10].asFunction<_GetDesc1Dart>();
+        final desc = calloc<Uint8>(312);
+        final ok = getDesc1(adapter, desc) == 0;
+        if (ok) {
+          final chars = desc.cast<Uint16>().asTypedList(128);
+          var len = 0;
+          while (len < 128 && chars[len] != 0) {
+            len++;
+          }
+          final name = String.fromCharCodes(chars.sublist(0, len));
+          final vram = (desc + 272).cast<UintPtr>().value;
+          if (name.isNotEmpty) results.add((name, vram));
+        }
+        calloc.free(desc);
+      } finally {
+        _comRelease(adapter);
+      }
+    }
+  } finally {
+    _comRelease(factory);
+  }
+  return results;
+}
+
+void _comRelease(Pointer<Void> comObject) {
+  if (comObject == nullptr) return;
+  try {
+    final vtable = comObject
+        .cast<Pointer<Pointer<NativeFunction<Int32 Function(Pointer<Void>)>>>>()
+        .value;
+    // IUnknown::Release is always slot 2.
+    final release = vtable[2].asFunction<int Function(Pointer<Void>)>();
+    release(comObject);
+  } catch (_) {
+    // Leak instead of crash.
+  }
+}
+
+// ─── UI ──────────────────────────────────────────────────────────────────────
 
 /// The visual panel, driven by a [SystemFeed].
 final class SystemPanel extends StatefulWidget {
@@ -210,21 +499,22 @@ final class SystemPanel extends StatefulWidget {
 }
 
 class _SystemPanelState extends State<SystemPanel> {
-  final SystemFeed _feed = SystemFeed();
+  SystemFeed? _feed;
   SystemSnapshot _snapshot = SystemSnapshot.empty;
 
   @override
   void initState() {
     super.initState();
-    _feed.stream.listen((snapshot) {
-      if (mounted) setState(() => _snapshot = snapshot);
-    });
-    _feed.start();
+    _feed = SystemFeed()
+      ..stream.listen((snapshot) {
+        if (mounted) setState(() => _snapshot = snapshot);
+      })
+      ..start();
   }
 
   @override
   void dispose() {
-    _feed.dispose();
+    _feed?.dispose();
     super.dispose();
   }
 
@@ -254,7 +544,13 @@ class _SystemPanelState extends State<SystemPanel> {
             children: [
               Text(detail, style: theme.textTheme.bodySmall),
               const SizedBox(height: 4),
-              LinearProgressIndicator(value: fraction),
+              if (fraction == null)
+                Text(
+                  'midiendo en el próximo tick…',
+                  style: theme.textTheme.labelSmall,
+                )
+              else
+                LinearProgressIndicator(value: fraction),
             ],
           ),
         ),
@@ -265,12 +561,12 @@ class _SystemPanelState extends State<SystemPanel> {
   @override
   Widget build(BuildContext context) {
     final s = _snapshot;
-    final vramText = s.gpuVramTotalMb == null
-        ? null
-        : '${_fmtMiB(s.gpuVramUsedMb ?? 0)} / ${_fmtMiB(s.gpuVramTotalMb!)}';
     final loadText = s.cpuLoadPercent == null
         ? ''
         : ' · ${s.cpuLoadPercent!.toStringAsFixed(0)}%';
+    final vramText = s.gpuVramTotalMb == null
+        ? ''
+        : '  ·  VRAM ${_fmtMb(s.gpuVramTotalMb!)}';
 
     return SizedBox(
       width: 480,
@@ -291,7 +587,7 @@ class _SystemPanelState extends State<SystemPanel> {
                   ),
                 ),
                 Text(
-                  'actualiza cada 2 s',
+                  'actualiza cada 4 s',
                   style: Theme.of(context).textTheme.labelSmall,
                 ),
               ],
@@ -299,9 +595,8 @@ class _SystemPanelState extends State<SystemPanel> {
             const SizedBox(height: 12),
             _meterRow(
               'CPU',
-              '${s.cpuName}'
-                  ' · ${s.physicalCores} núcleos / ${s.logicalCores} hilos'
-                  '$loadText',
+              '${s.physicalCores == 0 ? '' : '${s.physicalCores} núcleos · '}'
+                  '${s.logicalCores} hilos$loadText',
               s.cpuLoadPercent == null ? null : s.cpuLoadPercent! / 100,
               icon: Icons.memory,
             ),
@@ -311,23 +606,20 @@ class _SystemPanelState extends State<SystemPanel> {
               '${s.ramUsedGb.toStringAsFixed(1)} / '
                   '${s.ramTotalGb.toStringAsFixed(1)} GB'
                   '  ·  proceso: ${s.processRssMb.toStringAsFixed(0)} MB',
-              _fraction(s.ramUsedGb, s.ramTotalGb),
-              icon: Icons.sd_storage_outlined,
+              s.ramTotalGb <= 0 ? null : _fraction(s.ramUsedGb, s.ramTotalGb),
+              icon: Icons.storage,
             ),
             const SizedBox(height: 10),
             _meterRow(
               'GPU',
-              '${s.gpuName}'
-                  '${vramText == null ? '' : '  ·  VRAM $vramText'}',
-              s.gpuVramTotalMb == null
-                  ? null
-                  : _fraction(s.gpuVramUsedMb ?? 0, s.gpuVramTotalMb!),
+              '${s.gpuName}$vramText',
+              null, // DXGI no expone VRAM usada sin COM extra; solo datos.
               icon: Icons.developer_board,
             ),
-            if (s.llamaSystemInfo.isNotEmpty) ...[
+            if (s.detail.isNotEmpty) ...[
               const Divider(height: 20),
               SelectableText(
-                'llama.cpp: ${s.llamaSystemInfo}',
+                'llama.cpp: ${s.detail}',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ],
@@ -337,9 +629,9 @@ class _SystemPanelState extends State<SystemPanel> {
     );
   }
 
-  String _fmtMiB(double mib) {
-    if (mib >= 1024) return '${(mib / 1024).toStringAsFixed(1)} GB';
-    return '${mib.toStringAsFixed(0)} MB';
+  String _fmtMb(double mb) {
+    if (mb >= 1024) return '${(mb / 1024).toStringAsFixed(1)} GB';
+    return '${mb.toStringAsFixed(0)} MB';
   }
 }
 

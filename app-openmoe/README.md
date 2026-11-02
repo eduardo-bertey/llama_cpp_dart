@@ -16,10 +16,12 @@ flutter run -d windows
 
 ## Flujo de la app
 
-1. **Librería**: ruta a `llama.dll` (default `Desktop\llama\llama.dll`, o sea
-   el zip `llama-b*-bin-win-cpu-x64.zip` descomprimido). El paquete registra
-   esa carpeta en el DLL search path de Windows y resuelve los `ggml_*` por
-   la cadena llama → ggml-base → ggml → ggml-cpu-*.
+1. **Librería**: en el zip portable las DLLs de llama.cpp ya vienen **junto
+   al exe** y la app las detecta solas. Solo si ejecutaras el exe fuera del
+   paquete, eliges el `llama.dll` que corresponda con el selector de
+   archivos. El paquete registra esa carpeta en el DLL search path de
+   Windows y resuelve los `ggml_*` por la cadena llama → ggml-base →
+   ggml → ggml-cpu-*.
 2. **Modelo**: catálogo con entradas de HuggingFace, con **Qwen 0.8B
    (Qwen3.5-0.8B, ~0.7 GB con mmproj → visión)** como primera y recomendada,
    más las variantes Qwen3.8-Flash-Next (~77–95 GB). Al pedir descarga
