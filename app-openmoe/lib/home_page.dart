@@ -24,7 +24,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   String? _dll;
-  List<File> _downloadedModels = const <File>[];
+  List<File> _downloadedModels = <File>[];
   List<SavedChat> _savedChats = const <SavedChat>[];
 
   @override
@@ -56,22 +56,20 @@ class _HomePageState extends State<HomePage> {
     _dll = AppPaths.detectLibraryPath();
 
     final dir = Directory(AppPaths.resolveModelsDir);
-    _downloadedModels = dir.existsSync()
-        ? dir
-              .listSync()
-              .whereType<File>()
-              .where(
-                (f) =>
-                    f.path.toLowerCase().endsWith('.gguf') &&
-                    !File(f.path).uri.pathSegments.last
-                        .toLowerCase()
-                        .startsWith('mmproj'),
-              )
-              .toList()
-        : const <File>[];
-    _downloadedModels.sort(
-      (a, b) => File(a.path).lengthSync().compareTo(File(b.path).lengthSync()),
-    );
+    final models = <File>[];
+    if (dir.existsSync()) {
+      for (final entity in dir.listSync().whereType<File>()) {
+        final name = entity.uri.pathSegments.last.toLowerCase();
+        if (name.endsWith('.gguf') && !name.startsWith('mmproj')) {
+          models.add(entity);
+        }
+      }
+      models.sort(
+        (a, b) =>
+            File(a.path).lengthSync().compareTo(File(b.path).lengthSync()),
+      );
+    }
+    _downloadedModels = models;
 
     _savedChats = listSavedChats();
   }
