@@ -1,0 +1,85 @@
+name: build-windows
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: analyze + tests + Windows app bundle
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: dart pub get
+        run: dart pub get
+
+      - name: dart analyze
+        run: dart analyze
+
+      - name: dart format check
+        run: dart format --output=none --set-exit-if-changed lib tool/probe_windows_dlls.dart
+
+      - name: pure-dart tests
+        run: |
+          dart test test/utf8_accumulator_test.dart
+          dart test test/mobile_chat_api_test.dart
+          dart test test/android_native_assets_test.dart
+
+      - name: download llama.cpp Windows DLLs (b12050, cpu-x64)
+        run: |
+          New-Item -ItemType Directory -Force build\win-libs | Out-Null
+          Invoke-WebRequest `
+            -Uri 'https://github.com/ggml-org/llama.cpp/releases/download/b12050/llama-b12050-bin-win-cpu-x64.zip' `
+            -OutFile build\llama-b12050-bin-win-cpu-x64.zip
+          Expand-Archive `
+            -Path build\llama-b12050-bin-win-cpu-x64.zip `
+            -DestinationPath build\win-libs -Force
+
+      - name: symbol coverage vs generated bindings
+        run: python tool/windows_symbol_check.py build\win-libs
+
+      - name: loader probe against the real DLLs
+        run: dart run tool/probe_windows_dlls.dart build\win-libs
+
+      - name: flutter pub get (app-openmoe)
+        working-directory: app-openmoe
+        run: flutter pub get
+
+      - name: flutter analyze (app-openmoe)
+        working-directory: app-openmoe
+        run: flutter analyze
+
+      - name: flutter test (app-openmoe)
+        working-directory: app-openmoe
+        run: flutter test
+
+      - name: flutter build windows --release
+        working-directory: app-openmoe
+        run: flutter build windows --release
+
+      - name: bundle llama.cpp DLLs beside the app exe
+        run: |
+          $out = 'app-openmoe\build\windows\x64\runner\Release'
+          Copy-Item build\win-libs\*.dll $out -Force
+          Get-ChildItem $out | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: package portable zip
+        run: |
+          Compress-Archive `
+            -Path 'app-openmoe\build\windows\x64\runner\Release\*' `
+            -DestinationPath openmoe-windows-portable.zip -Force
+          Get-Item openmoe-windows-portable.zip | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openmoe-windows-portable
+          path: openmoe-windows-portable.zip
+          if-no-files-found: error

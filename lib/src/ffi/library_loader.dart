@@ -1,5 +1,5 @@
 import 'dart:ffi';
-import 'dart:io' show File, FileSystemException, Platform;
+import 'dart:io' show Directory, File, FileSystemException, Platform;
 
 import 'package:ffi/ffi.dart';
 
@@ -20,6 +20,12 @@ final class LlamaLibrary {
   static String? _libraryDir;
   static DynamicLibrary? _llamaLib;
   static DynamicLibrary? _mtmdLib;
+  static final List<DynamicLibrary> _ggmlFallbackLibs = <DynamicLibrary>[];
+
+  /// Windows helper handles. `kernel32` is always present in a process; this
+  /// handle exists so [SetDllDirectoryW] can be reached via FFI without a
+  /// dedicated depedency declaration in [dispose].
+  static DynamicLibrary? _kernel32;
 
   /// Lazily-resolved bindings. Throws if [load] has not been called.
   static LlamaBindings get bindings {
@@ -96,6 +102,17 @@ final class LlamaLibrary {
 
     final DynamicLibrary llama;
     try {
+      // Windows: the loader resolves sibling dependencies of llama.dll
+      // (ggml-base.dll, ggml.dll, ggml-cpu-*.dll) through the classic DLL
+      // search order, which starts at the process .exe directory — NOT at
+      // the directory of the DLL being opened. "The specified module could
+      // not be found" (error 126) is what a missing directory produces.
+      // Point the fallback search slot at the llama.dll folder first, e.g.
+      // the unpacked `llama-b*-bin-win-cpu-x64` release.
+      final searchDir = _dirOf(path);
+      if (Platform.isWindows && searchDir != null) {
+        _setWindowsSearchDirectory(searchDir);
+      }
       llama = DynamicLibrary.open(path);
     } on ArgumentError catch (e) {
       throw LlamaLibraryException('failed to open $path: $e');
@@ -135,6 +152,30 @@ final class LlamaLibrary {
       }
     }
     _mtmdLib = mtmd;
+
+    // Official llama.cpp Windows builds split ggml across several DLLs:
+    //
+    //   llama.dll        — llama_* public C API only
+    //   ggml-base.dll    — the core ggml_* C API
+    //   ggml.dll         — backend registry + loader (ggml_backend_load_all…)
+    //   ggml-cpu-*.dll   — CPU implementations (feature-dispatched variants)
+    //
+    // The FFI bindings, however, resolve *all* non-mtmd symbols through the
+    // llama handle: when ggml is linked into libllama (macOS dylib builds,
+    // the Android AAR) the symbols land there. With the official DLLs they
+    // can't, so install a lookup fallback chain across those DLLs.
+    //
+    // Only Windows populates it; other platforms keep symbol resolution
+    // unchanged.
+    final llamaDir = _dirOf(path);
+    if (Platform.isWindows &&
+        llamaDir != null &&
+        !_canLookup<NativeFunction<Void Function()>>(
+          llama,
+          'ggml_backend_load_all_from_path',
+        )) {
+      _openWindowsGgmlFallbacks(llamaDir);
+    }
 
     final bindings = LlamaBindings.fromLookup(_routedLookup);
     bindings.llama_backend_init();
@@ -183,7 +224,101 @@ final class LlamaLibrary {
       }
       return m.lookup<T>(name);
     }
-    return _llamaLib!.lookup<T>(name);
+    final llama = _llamaLib!;
+    try {
+      return llama.lookup<T>(name);
+    } on ArgumentError {
+      // Fall through the Windows ggml DLL family before giving up. Kept
+      // empty on every other platform (see load() for when it is filled).
+      for (final lib in _ggmlFallbackLibs) {
+        try {
+          return lib.lookup<T>(name);
+        } on ArgumentError {
+          continue;
+        }
+      }
+      rethrow;
+    }
+  }
+
+  /// True when [lib] exports [name]. Existence check only — the signature is
+  /// not validated here.
+  static bool _canLookup<T extends NativeType>(
+    DynamicLibrary lib,
+    String name,
+  ) {
+    try {
+      lib.lookup<T>(name);
+      return true;
+    } on ArgumentError {
+      return false;
+    }
+  }
+
+  /// Register [dir] in the Windows DLL search path so LoadLibrary calls made
+  /// afterwards — including dependency resolution of the libraries we open —
+  /// consult it. Implemented on top of `SetDllDirectoryW`, best effort: a
+  /// failure here is not fatal because the subsequent open reports a clear
+  /// error if dependency resolution ends up broken anyway.
+  static void _setWindowsSearchDirectory(String dir) {
+    try {
+      final kernel32 = _kernel32 ??= DynamicLibrary.open('kernel32.dll');
+      final setDir = kernel32
+          .lookupFunction<
+            Int32 Function(Pointer<Utf16>),
+            int Function(Pointer<Utf16>)
+          >('SetDllDirectoryW');
+      final nativeDir = dir.toNativeUtf16();
+      setDir(nativeDir);
+      malloc.free(nativeDir);
+    } catch (_) {
+      // Best effort, as documented.
+    }
+  }
+
+  /// Populate [_ggmlFallbackLibs] from the DLLs sitting beside llama.dll.
+  ///
+  /// Order matters: `ggml-base.dll` exports the bulk of the `ggml_*` C API,
+  /// `ggml-cpu-*.dll` variants export the CPU helpers (`ggml_cpu_has_*`,
+  /// `ggml_threadpool_*`, …), and `ggml.dll` (the router) exports the
+  /// backend loader/registry calls (`ggml_backend_load_all`, …).
+  static void _openWindowsGgmlFallbacks(String dir) {
+    final d = Directory(dir);
+    if (!d.existsSync()) return;
+
+    int rankOf(String name) {
+      if (name == 'ggml-base.dll') return 0;
+      if (name == 'ggml.dll') return 2;
+      return 1;
+    }
+
+    final candidates =
+        d
+            .listSync()
+            .whereType<File>()
+            .map((f) => f.path.split(Platform.pathSeparator).last)
+            .where(
+              (name) =>
+                  name == 'ggml-base.dll' ||
+                  name == 'ggml.dll' ||
+                  (name.startsWith('ggml-cpu') && name.endsWith('.dll')),
+            )
+            .toList()
+          ..sort((a, b) {
+            final byRole = rankOf(a).compareTo(rankOf(b));
+            if (byRole != 0) return byRole;
+            return a.compareTo(b);
+          });
+
+    for (final name in candidates) {
+      final path = '${d.path}${Platform.pathSeparator}$name';
+      try {
+        _ggmlFallbackLibs.add(DynamicLibrary.open(path));
+      } on ArgumentError {
+        // Skip silently; the routed lookup surfaces a real error later if
+        // a symbol we need is genuinely missing.
+      }
+    }
   }
 
   static String? _mtmdFileName() {
@@ -247,6 +382,7 @@ final class LlamaLibrary {
     _libraryDir = null;
     _llamaLib = null;
     _mtmdLib = null;
+    _ggmlFallbackLibs.clear();
   }
 
   /// Default file name for the llama library on the current platform.
